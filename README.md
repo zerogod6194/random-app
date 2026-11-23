@@ -1,1 +1,1 @@
-# random-app
+# HeatCheck-app
