@@ -13,7 +13,7 @@ import streamlit as st
 DEVICES = {
     "자동차": {
         "icon": "🚗",
-        "power_kw": 7.0,      # 전기차 완속 충전기 기준 소비전력(kW)
+        "power_kw": 7.0,      # 공급받은 열 E 기본값 계산용 (7 kW = 1초당 7000 J)
         "avg_eff": 80.0,      # 같은 종류 기기의 평균 효율(%) 가정값
         "desc": "전기차 완속 충전(7 kW) 기준",
     },
@@ -39,6 +39,7 @@ DEVICES = {
 
 DEFAULT_RATE = 120.0   # 전기요금 단가(원/kWh) 가정값
 COMPARE_MARGIN = 5.0   # 평균 대비 ±5%p 이내면 '중'
+JOULE_PER_KWH = 3_600_000   # 1 kWh = 3,600,000 J
 
 
 # ─────────────────────────────────────────────────────────────
@@ -82,21 +83,29 @@ def compare_with_average(effciency: float, average: float) -> str:
 
 
 def calculate_electric(provide_e: float, useful_e: float, time: float,
-                       power_kw: float = 1.0, rate: float = DEFAULT_RATE) -> dict:
-    """전기세 계산기: time(시간) 동안 사용했을 때의 전력량 · 전기세 · 버려진 열 요금
+                       rate: float = DEFAULT_RATE) -> dict:
+    """전기세 계산기: 입력한 열 E로 time(시간) 동안 사용했을 때의 전기세
 
-    전기세(원) = 소비전력(kW) × 사용시간(h) × 단가(원/kWh)
-    버려진 열 요금(원) = 전기세 × (1 − effciency / 100)
+    provide_e 는 기기가 1초 동안 공급받는 열(J) → 1초당 J 는 곧 W(와트)
+    사용 전력량(kWh) = provide_e(J/s) × time(h) × 3600(s/h) ÷ 3,600,000(J/kWh)
+    전기세(원)       = 사용 전력량 × 단가(원/kWh)
+    버려진 열 요금    = 전기세 × (1 − effciency / 100)
     """
     effciency = calculate_energy(provide_e, useful_e)
-    usage_kwh = power_kw * time
+    total_joule = provide_e * time * 3600          # time 시간 동안 공급받은 전체 열(J)
+    usage_kwh = total_joule / JOULE_PER_KWH
     cost = usage_kwh * rate
     wasted_cost = cost * (1 - effciency / 100)
-    return {"usage_kwh": usage_kwh, "cost": cost, "wasted_cost": wasted_cost}
+    useful_cost = cost - wasted_cost
+    return {
+        "usage_kwh": usage_kwh,
+        "cost": cost,
+        "useful_cost": useful_cost,
+        "wasted_cost": wasted_cost,
+    }
 
 
-def build_bill_table(provide_e: float, useful_e: float, selected_hours: int,
-                     power_kw: float, rate: float) -> list:
+def build_bill_table(provide_e: float, useful_e: float, selected_hours: int, rate: float) -> list:
     """반복문(for)으로 1시간 · 선택 시간 · 24시간 전기세 통지표 생성"""
     periods = [
         ("1시간", 1),
@@ -105,12 +114,13 @@ def build_bill_table(provide_e: float, useful_e: float, selected_hours: int,
     ]
     rows = []
     for label, time in periods:
-        bill = calculate_electric(provide_e, useful_e, time, power_kw, rate)
+        bill = calculate_electric(provide_e, useful_e, time, rate)
         rows.append(
             {
                 "사용 시간": label,
                 "사용 전력량 (kWh)": f"{bill['usage_kwh']:,.3f}",
                 "전기세 (원)": f"{bill['cost']:,.0f}",
+                "유용하게 쓴 요금 (원)": f"{bill['useful_cost']:,.0f}",
                 "버려진 열 요금 (원)": f"{bill['wasted_cost']:,.0f}",
             }
         )
@@ -226,28 +236,33 @@ with left:
 
     st.markdown('<div class="step">② 열에너지 입력</div>', unsafe_allow_html=True)
     in1, in2 = st.columns(2)
-    provide_e = in1.number_input("공급받은 열 E (J)", min_value=0.0, value=1000.0, step=10.0)
-    useful_e = in2.number_input("유용하게 사용된 열 E (J)", min_value=0.0, value=600.0, step=10.0)
+    default_provide = info["power_kw"] * 1000
+    default_useful = round(default_provide * info["avg_eff"] / 100, 2)
+    provide_e = in1.number_input(
+        "공급받은 열 E (J, 1초 기준)", min_value=0.0, value=default_provide,
+        step=10.0, key=f"provide_{device}",
+    )
+    useful_e = in2.number_input(
+        "유용하게 사용된 열 E (J, 1초 기준)", min_value=0.0, value=default_useful,
+        step=10.0, key=f"useful_{device}",
+    )
+    st.caption("1초 동안 주고받는 열을 입력하세요. 1초당 1 J = 1 W 이므로, 이 값으로 전기세를 계산합니다.")
 
     st.markdown('<div class="step">③ 사용 시간</div>', unsafe_allow_html=True)
     hours = st.slider("몇 시간 사용하나요?", min_value=1, max_value=24, value=3, format="%d시간")
 
-    with st.expander("⚙️ 기준값 설정 (소비전력 · 전기요금 단가 · 평균 효율)"):
-        s1, s2, s3 = st.columns(3)
-        power_kw = s1.number_input(
-            "소비전력 (kW)", min_value=0.001, value=float(info["power_kw"]),
-            step=0.1, format="%.3f", key=f"power_{device}",
-        )
-        rate = s2.number_input(
+    with st.expander("⚙️ 기준값 설정 (전기요금 단가 · 평균 효율)"):
+        s1, s2 = st.columns(2)
+        rate = s1.number_input(
             "전기요금 단가 (원/kWh)", min_value=1.0, value=DEFAULT_RATE, step=10.0,
         )
-        avg_eff = s3.number_input(
+        avg_eff = s2.number_input(
             f"{device} 평균 효율 (%)", min_value=1.0, max_value=100.0,
             value=float(info["avg_eff"]), step=1.0, key=f"avg_{device}",
         )
         st.caption(
             "기본값은 계산을 위한 예시 가정값입니다. "
-            "실제 기기의 소비전력과 한국전력 요금표에 맞게 고쳐 쓰세요."
+            "한국전력 요금표와 실제 기기 자료에 맞게 고쳐 쓰세요."
         )
 
     apply_clicked = st.button("✅ 적용", type="primary", use_container_width=True)
@@ -280,9 +295,9 @@ if apply_clicked:
             "level": compare_with_average(effciency, avg_eff),
             "avg_eff": avg_eff,
             "hours": hours,
-            "power_kw": power_kw,
+            "provide_e": provide_e,
             "rate": rate,
-            "bill": build_bill_table(provide_e, useful_e, hours, power_kw, rate),
+            "bill": build_bill_table(provide_e, useful_e, hours, rate),
         }
 
 # ── 결과 출력 화면 ────────────────────────────────────────────
@@ -321,7 +336,8 @@ else:
                 - **열효율(%)** = 유용하게 사용된 열 ÷ 공급받은 열 × 100
                 - **효율등급** : 80% 이상 1등급 · 60% 이상 2등급 · 40% 이상 3등급 · 20% 이상 4등급 · 그 미만 5등급
                 - **상 / 중 / 하** : 같은 종류 기기의 평균 효율보다 5%p 이상 높으면 상, ±5%p 이내면 중, 그보다 낮으면 하
-                - **전기세(원)** = 소비전력(kW) × 사용 시간(h) × 단가(원/kWh)
+                - **사용 전력량(kWh)** = 공급받은 열(J/s) × 사용 시간(h) × 3600 ÷ 3,600,000
+                - **전기세(원)** = 사용 전력량(kWh) × 단가(원/kWh)
                 - **버려진 열 요금** = 전기세 × (1 − 열효율)
                 """
             )
@@ -330,6 +346,6 @@ else:
         st.markdown(f"#### 🧾 전기세 통지표 — {result['device']}")
         st.table(result["bill"])
         st.caption(
-            f"소비전력 {result['power_kw']:g} kW · 단가 {result['rate']:,.0f}원/kWh 기준 "
+            f"공급받은 열 {result['provide_e']:,.0f} J/s (= {result['provide_e'] / 1000:g} kW) · 단가 {result['rate']:,.0f}원/kWh 기준 "
             "(기본요금·세금·누진제 제외)"
         )
